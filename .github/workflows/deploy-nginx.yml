@@ -1,0 +1,66 @@
+name: Deploy NGINX to Tanzu
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment environment
+        required: true
+        type: choice
+        options: [dev, staging, production]
+      image_tag:
+        description: Existing NGINX image tag in approved JFrog registry
+        required: true
+        type: string
+        default: stable
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nginx-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Set repository variable DEPLOY_RUNNER_LABEL to the actual Telia-managed Ubuntu runner label.
+    runs-on: ${{ vars.DEPLOY_RUNNER_LABEL }}
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Deploy NGINX with Helm
+        shell: bash
+        env:
+          TARGET_ENV: ${{ inputs.environment }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          IMAGE_REPOSITORY: ${{ vars.NGINX_IMAGE_REPOSITORY }}
+          KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG }}
+          EXPECTED_CONTEXT: ${{ vars.K8S_CONTEXT }}
+          TARGET_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+        run: |
+          set -euo pipefail
+          command -v helm >/dev/null || { echo 'Helm is missing on the Telia runner' >&2; exit 1; }
+          : "${KUBECONFIG_CONTENT:?Missing environment secret KUBECONFIG}"
+          : "${IMAGE_REPOSITORY:?Missing NGINX_IMAGE_REPOSITORY}"
+          : "${EXPECTED_CONTEXT:?Missing K8S_CONTEXT}"
+          : "${TARGET_NAMESPACE:?Missing K8S_NAMESPACE}"
+          [[ "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || { echo 'Invalid image tag' >&2; exit 1; }
+          config_path="$(mktemp "${RUNNER_TEMP:-/tmp}/kubeconfig.XXXXXX")"
+          trap 'rm -f "$config_path"' EXIT
+          chmod 600 "$config_path"
+          printf '%s' "$KUBECONFIG_CONTENT" > "$config_path"
+          export KUBECONFIG="$config_path"
+          values_file="./chart/nginx/values-${TARGET_ENV}.yaml"
+          helm lint ./chart/nginx -f "$values_file" --set-string "image.repository=$IMAGE_REPOSITORY"
+          helm upgrade --install nginx-demo ./chart/nginx \
+            --kube-context "$EXPECTED_CONTEXT" \
+            --namespace "$TARGET_NAMESPACE" --create-namespace \
+            -f "$values_file" \
+            --set-string "image.repository=$IMAGE_REPOSITORY" \
+            --set-string "image.tag=$IMAGE_TAG" \
+            --wait --timeout 5m
+          helm status nginx-demo --kube-context "$EXPECTED_CONTEXT" -n "$TARGET_NAMESPACE"
